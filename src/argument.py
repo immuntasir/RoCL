@@ -143,6 +143,13 @@ def parser():
     parser.add_argument('--k', type=int, default=7, help='maximum iteration when generating adversarial examples')
     parser.add_argument('--random_start', type=bool, default=True,
         help='True for PGD')
+
+    parser.add_argument('--cluster-temperature', default=0.2, type=float,
+                        help='softmax temperature')
+    parser.add_argument('--num-cluster', default='100,500,10000', type=str,
+                        help='number of clusters')
+    parser.add_argument('--low-dim', default=512, type=int,
+                        help='feature dimension (default: 512)')
     
     args = parser.parse_args()
 

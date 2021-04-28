@@ -24,6 +24,10 @@ def get_dataset(args):
 
             transform_test = transform_train
 
+            transform_eval = transforms.Compose([
+                transforms.ToTensor(),
+            ])
+
         elif learning_type=='linear_eval':
             transform_train = transforms.Compose([
                 rnd_color_jitter,
@@ -67,13 +71,18 @@ def get_dataset(args):
                     sampler=train_sampler,
                 )
 
+            eval_loader = torch.utils.data.DataLoader(train_dst,batch_size=args.batch_size,
+                    num_workers=4,
+                    pin_memory=False,
+                    shuffle=False,
+                )
             val_loader = torch.utils.data.DataLoader(val_dst,batch_size=100,
                     num_workers=4,
                     pin_memory=False,
                     shuffle=False,
                 )
             
-            return train_loader, train_dst, val_loader, val_dst, train_sampler
+            return train_loader, train_dst, val_loader, val_dst, train_sampler, eval_loader
         else:
             train_loader = torch.utils.data.DataLoader(train_dst,
                                                   batch_size=args.batch_size,

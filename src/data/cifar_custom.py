@@ -51,7 +51,7 @@ class CIFAR10(VisionDataset):
     }
 
     def __init__(self, root, train=True, transform=None, target_transform=None,
-                 download=False, contrastive_learning=False):
+                 download=False, contrastive_learning=False, split=.1):
 
         super(CIFAR10, self).__init__(root, transform=transform,
                                       target_transform=target_transform)
@@ -146,7 +146,7 @@ class CIFAR10(VisionDataset):
             target = self.target_transform(target)
 
         if self.learning_type=='contrastive':
-            return ori_img, img, img_2, target, index
+            return ori_img, img, img_2, target
         elif self.learning_type=='linear_eval':
             if self.train:
                 return ori_img, img, img_2, target

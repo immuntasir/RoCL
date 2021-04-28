@@ -1,7 +1,7 @@
 #!/usr/bin/env python3 -u
 
 from __future__ import print_function
-
+from tqdm import tqdm
 import csv
 import os
 
@@ -21,12 +21,17 @@ from utils import progress_bar, checkpoint, AverageMeter, accuracy
 from loss import pairwise_similarity, NT_xent
 from torchlars import LARS
 from warmup_scheduler import GradualWarmupScheduler
-
+import faiss
+import numpy as np
 args = parser()
+args.num_cluster = [100, 500, 1000]
+args.low_dim = 512
+args.cluster_temparature = .2
 
 def print_status(string):
     if args.local_rank % ngpus_per_node == 0:
         print(string)
+
 
 ngpus_per_node = torch.cuda.device_count()
 if args.ngpu>1:
@@ -56,7 +61,7 @@ print_status('==> Preparing data..')
 if not (args.train_type=='contrastive'):
     assert('wrong train phase...')
 else:
-    trainloader, traindst, testloader, testdst ,train_sampler = data_loader.get_dataset(args)
+    trainloader, traindst, testloader, testdst ,train_sampler, eval_loader = data_loader.get_dataset(args)
 
 # Model
 print_status('==> Building model..')
@@ -115,6 +120,106 @@ optimizer       = LARS(optimizer=base_optimizer, eps=1e-8, trust_coef=0.001)
 scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epoch)
 scheduler_warmup = GradualWarmupScheduler(optimizer, multiplier=args.lr_multiplier, total_epoch=10, after_scheduler=scheduler_cosine)
 
+'''
+Adding codes for prototypes
+'''
+
+
+def compute_features(eval_loader, model, args, debug=False):
+    print('Computing features...')
+    model.eval()
+    features = torch.zeros(len(eval_loader.dataset), args.low_dim).cuda()
+
+    if debug:
+        labels_save = np.zeros(len(eval_loader.dataset))
+
+    for i, (images, inputs_1, inputs_2, labels, index) in enumerate(tqdm(eval_loader)):
+        with torch.no_grad():
+            images = images.cuda(non_blocking=True)
+            feat = model(images)
+            features[index] = feat
+            if debug:
+                for idx, img_index in enumerate(index):
+                    labels_save[img_index] = labels[idx]
+    torch.distributed.barrier()
+    torch.distributed.all_reduce(features, op=torch.distributed.ReduceOp.SUM)
+    if debug:
+        return features.cpu(), labels_save
+    else:
+        return features.cpu()
+
+
+def run_kmeans(x, args):
+    """
+    Args:
+        x: data to be clustered
+    """
+
+    print('performing kmeans clustering')
+    results = {'im2cluster': [], 'centroids': [], 'density': []}
+
+    for seed, num_cluster in enumerate(args.num_cluster):
+        # intialize faiss clustering parameters
+        d = x.shape[1]
+        k = int(num_cluster)
+        clus = faiss.Clustering(d, k)
+        clus.verbose = True
+        clus.niter = 20
+        clus.nredo = 5
+        clus.seed = seed
+        clus.max_points_per_centroid = 1000
+        clus.min_points_per_centroid = 10
+
+        res = faiss.StandardGpuResources()
+        cfg = faiss.GpuIndexFlatConfig()
+        cfg.useFloat16 = False
+        cfg.device = 0 #Muntasir: I hardcoded this part
+        index = faiss.GpuIndexFlatL2(res, d, cfg)
+
+        clus.train(x, index)
+
+        D, I = index.search(x, 1)  # for each sample, find cluster distance and assignments
+        im2cluster = [int(n[0]) for n in I]
+
+        # get cluster centroids
+        centroids = faiss.vector_to_array(clus.centroids).reshape(k, d)
+
+        # sample-to-centroid distances for each cluster
+        Dcluster = [[] for c in range(k)]
+        for im, i in enumerate(im2cluster):
+            Dcluster[i].append(D[im][0])
+
+        # concentration estimation (phi)
+        density = np.zeros(k)
+        for i, dist in enumerate(Dcluster):
+            if len(dist) > 1:
+                d = (np.asarray(dist) ** 0.5).mean() / np.log(len(dist) + 10)
+                density[i] = d
+
+                # if cluster only has one point, use the max to estimate its concentration
+        dmax = density.max()
+        for i, dist in enumerate(Dcluster):
+            if len(dist) <= 1:
+                density[i] = dmax
+
+        density = density.clip(np.percentile(density, 10),
+                               np.percentile(density, 90))  # clamp extreme values for stability
+        density = args.temperature * density / density.mean()  # scale the mean to temperature
+
+        # convert to cuda Tensors for broadcast
+        centroids = torch.Tensor(centroids).cuda()
+        centroids = torch.nn.functional.normalize(centroids, p=2, dim=1)
+
+        im2cluster = torch.LongTensor(im2cluster).cuda()
+        density = torch.Tensor(density).cuda()
+
+        results['centroids'].append(centroids)
+        results['density'].append(density)
+        results['im2cluster'].append(im2cluster)
+
+    return results
+
+
 def train(epoch):
     if args.local_rank % ngpus_per_node == 0:
         print('\nEpoch: %d' % epoch)
@@ -129,7 +234,28 @@ def train(epoch):
     reg_simloss = 0
     reg_loss = 0
 
-    for batch_idx, (ori, inputs_1, inputs_2, label) in enumerate(trainloader):
+    # compute momentum features for center-cropped images
+    features, labels = compute_features(eval_loader, model, args, debug=True)
+    print('Feature Shape:', features.shape)
+
+    # placeholder for clustering result
+    cluster_result = {'im2cluster': [], 'centroids': [], 'density': []}
+    for num_cluster in args.num_cluster:
+        cluster_result['im2cluster'].append(torch.zeros(eval_loader.__len__(), dtype=torch.long).cuda())
+        cluster_result['centroids'].append(torch.zeros(int(num_cluster), args.low_dim).cuda())
+        cluster_result['density'].append(torch.zeros(int(num_cluster)).cuda())
+
+    #Muntasir: commented out the following line
+    #if args.gpu == 0:
+    #features[torch.norm(features, dim=1) > 1.5] /= 2  # account for the few samples that are computed twice
+    features = features.numpy()
+    cluster_result = run_kmeans(features, args)  # run kmeans clustering on master node
+    if epoch % 50 ==0:
+        torch.save(cluster_result, os.path.join('results/', 'clusters_%d' % epoch))
+        torch.save(features, os.path.join('results/', 'features_%d' % epoch))
+        torch.save(labels, os.path.join('results/', 'labels_%d' % epoch))
+
+    for batch_idx, (ori, inputs_1, inputs_2, label, index) in enumerate(trainloader):
         ori, inputs_1, inputs_2 = ori.cuda(), inputs_1.cuda() ,inputs_2.cuda()
 
         if args.attack_to=='original':
